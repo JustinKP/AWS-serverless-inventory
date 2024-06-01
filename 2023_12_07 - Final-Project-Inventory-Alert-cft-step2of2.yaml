@@ -1,0 +1,214 @@
+Metadata: 
+  License: Apache-2.0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Final Project: Creates an inventory tracking system which reads inventory files and sends SMS alerts.'
+Parameters:
+  PhoneNumber:
+    Description: Phone number where alarms will be sent (like +15194106440)
+    Type: String
+Resources:
+
+  #                                               !!!!!VERY IMPORTANT!!!!!
+  #In order for the S3 bucket to have a lambda trigger, you NEED to use step1of2 for the base cloudformation stack creation!
+  #Once the create is complete, then you can update the stack using step2of2, which will give the S3 bucket the trigger it needs.
+  #This is because of a recursive issue with the way the trigger relys on the permission, as is discussed at the top of this page:
+  #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-s3-bucket-notificationconfiguration.html
+  #
+  #Also, for me, I have to go to the page below, scroll down to "Sandbox destination phone numbers", and add my phone number for the SMS notifications to work:
+  #https://us-east-1.console.aws.amazon.com/sns/v3/home?region=us-east-1#/mobile/text-messaging
+  #
+  #That is all, thanks for reading, you probably have to do these steps for all the projects so this is probably redundent, but just in case yknow?
+  #
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: inventory-files-s3-bucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:*'
+          Function: !GetAtt LFBucketListener.Arn
+
+  LFBucketPermission:
+    Type: AWS::Lambda::Permission
+    #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html
+    DependsOn:
+     - S3Bucket
+     - LFBucketListener
+    Properties:
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !GetAtt S3Bucket.Arn
+      Principal: s3.amazonaws.com
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LFBucketListener.Arn
+
+  LFBucketListener:
+    Type: AWS::Lambda::Function 
+    #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-function.html
+    Properties:
+      Handler: index.lambda_handler
+      FunctionName: LambdaFunctionBucketListener
+      Description: Lambda Function that reads (inventory) files added to InventoryFileBucket and inserts the listed items into the DynamoDB table
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          s3_client = boto3.client('s3')
+          table = boto3.resource('dynamodb').Table('InventoryTable')
+
+          def lambda_handler(event, context):
+              try:
+                  for record in event['Records']:
+                      # Gets object
+                      response = s3_client.get_object(
+                          Bucket = record['s3']['bucket']['name'],
+                          Key    = record['s3']['object']['key']
+                      )
+
+                      # Extract the object data
+                      inventoryFile = response['Body'].read().decode('utf-8')  # Assuming it's a text file; adjust for binary data
+                      print('object_data:', inventoryFile)
+
+                      # Unpack CSV data and insert into table
+                      inventoryData = inventoryFile.replace('\t',',').split('\n')
+                      for entry in inventoryData[1:]:
+                          entry = entry.split(',')
+                          for i in range(len(entry)):
+                              entry[i] = entry[i].strip()
+                          
+                          table.put_item(
+                              Item = {
+                                  'storeLoc':     entry[0],
+                                  'itemName':     entry[1],
+                                  'invCount': int(entry[2])
+                              }
+                          )
+
+                      return {
+                          'statusCode': 200,
+                          'body': inventoryFile
+                      }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error: {str(e)}'
+                  }
+      PackageType: Zip
+      Timeout: 30
+
+  DynamoDBInventoryTable:
+    Type: AWS::DynamoDB::Table
+    #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-dynamodb-table.html
+    #https://repost.aws/articles/ARanFOzKSzSj2c27o0-SvxnQ/creating-a-dynamodb-table-with-cloudformation-and-adding-items-at-creation-time
+    Properties:
+      TableName: InventoryTable
+      TableClass: STANDARD
+      BillingMode: PROVISIONED #PAY_PER_REQUEST
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions: 
+        - AttributeName: 'storeLoc'
+          AttributeType: 'S'
+        - AttributeName: 'itemName'
+          AttributeType: 'S'
+      KeySchema: 
+        #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-dynamodb-table-keyschema.html
+        - AttributeName: 'storeLoc'
+          KeyType: 'HASH' #i'm just winging it with thse values if i'm being honest
+        - AttributeName: 'itemName'
+          KeyType: 'RANGE'
+      StreamSpecification: 
+        StreamViewType: NEW_IMAGE
+
+  LFDynoDBEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-eventsourcemapping.html
+    #https://docs.aws.amazon.com/lambda/latest/dg/with-ddb.html#services-dynamodb-eventsourcemapping
+    #https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.Lambda.html
+    #https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.Lambda.Tutorial2.html
+    DependsOn:
+    - DynamoDBInventoryTable
+    - LFDynoDBListener
+    Properties:
+      BatchSize: 1 #Default is 100, Max is 10000
+      EventSourceArn: !GetAtt DynamoDBInventoryTable.StreamArn
+      FunctionName: !Ref LFDynoDBListener
+      StartingPosition: LATEST #TRIM_HORIZON #LATEST|TRIM_HORIZON #TRIM_HORIZON = Process all available records.
+
+  LFDynoDBListener:
+    Type: AWS::Lambda::Function 
+    #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-function.html
+    Properties:
+      Handler: index.lambda_handler
+      FunctionName: LambdaFunctionDynoDBListener
+      Description: Lambda Function that monitors DynamoDB updates and send notifications through Amazon SNS when inventory levels are critically low (defined as 5 or less number of the product).
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SNStopicARN: !Ref SNSTopicTextAlert
+      Code:
+        #https://dynobase.dev/dynamodb-triggers/
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          sns = boto3.client('sns')
+          SNStopicARN = os.environ['SNStopicARN']
+
+          def lambda_handler(event, context):
+              try:
+                  validFlag = False
+                  message = "The following items are running out:"
+                  
+                  print(event)
+                  change_records = event['Records']
+                  for record in change_records:
+                      if (record['eventName'] == "INSERT") or (record['eventName'] == "MODIFY"):
+                          storeLoc = record['dynamodb']['NewImage']['storeLoc']['S']
+                          itemName = record['dynamodb']['NewImage']['itemName']['S']
+                          invCount = record['dynamodb']['NewImage']['invCount']['N']
+
+                          if (int(invCount) <= 5):
+                              validFlag = True
+                              message = message+"\n"+storeLoc+": "+itemName+" ("+str(invCount)+")"
+                  
+                  if (validFlag):
+                      response = sns.publish(
+                          TopicArn=SNStopicARN,
+                          Message=message
+                      )
+                      print("Message published")
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': response
+                      }
+                  else:
+                      return {
+                          'statusCode': 200,
+                          'body': "event was never INSERT or MODIFY"
+                      }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error: {str(e)}'
+                  }
+      PackageType: Zip
+      Timeout: 30
+  
+  SNSTopicTextAlert:
+    Type: AWS::SNS::Topic
+    #https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sns-topic.html
+    Properties:
+      DisplayName: LowInventoryAlert
+      TopicName: SNSTopicTextAlert
+      Subscription: #The associated subscription is not deleted when the AWS::SNS::Topic resource is deleted!
+        - Protocol: sms
+          Endpoint: !Ref PhoneNumber
